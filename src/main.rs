@@ -563,8 +563,7 @@ impl TypeGraph {
                 &mut visited,
                 &mut path,
                 &mut path_positions,
-            )
-            {
+            ) {
                 return Some(cycle);
             }
         }
@@ -731,8 +730,15 @@ fn collect_type_refs(
                 );
             }
 
+            let is_impl_object = object.contains_key("for")
+                && object.contains_key("is_synthetic")
+                && object.contains_key("items");
+
             for (key, nested) in object {
                 if is_rustdoc_backreference_key(key) {
+                    continue;
+                }
+                if is_impl_object && key == "for" {
                     continue;
                 }
 
@@ -1252,6 +1258,106 @@ mod tests {
             graph
                 .edges
                 .contains(&("0:2".to_string(), "0:1".to_string()))
+        );
+    }
+
+    #[test]
+    fn ignores_impl_self_type_arguments() {
+        let json = json!({
+            "root": "0:0",
+            "index": {
+                "0:0": item(0, "test_crate", json!({"module": {"items": ["0:1", "0:2", "0:3"]}})),
+                "0:1": item(0, "Cartridge", json!({"struct": {
+                    "kind": {"plain": {"fields": [], "has_stripped_fields": false}},
+                    "generics": {
+                        "params": [{
+                            "name": "M",
+                            "kind": {"type": {
+                                "bounds": [{
+                                    "trait_bound": {
+                                        "trait": {"path": "CartridgeMemory", "id": "0:2", "args": null},
+                                        "generic_params": [],
+                                        "modifier": "none"
+                                    }
+                                }],
+                                "default": null,
+                                "is_synthetic": false
+                            }}
+                        }],
+                        "where_predicates": []
+                    },
+                    "impls": ["0:4"]
+                }})),
+                "0:2": item(0, "CartridgeMemory", json!({"trait": {
+                    "is_auto": false,
+                    "is_unsafe": false,
+                    "items": [],
+                    "generics": {"params": [], "where_predicates": []},
+                    "bounds": [],
+                    "implementations": ["0:5"]
+                }})),
+                "0:3": item(0, "NromMemory", json!({"struct": {
+                    "kind": {"plain": {"fields": [], "has_stripped_fields": false}},
+                    "generics": {"params": [], "where_predicates": []},
+                    "impls": ["0:5"]
+                }})),
+                "0:4": item(0, "", json!({"impl": {
+                    "is_unsafe": false,
+                    "generics": {"params": [], "where_predicates": []},
+                    "provided_trait_methods": [],
+                    "trait": null,
+                    "for": {"resolved_path": {
+                        "path": "Cartridge",
+                        "id": "0:1",
+                        "args": {"angle_bracketed": {
+                            "args": [{"type": {"resolved_path": {
+                                "path": "NromMemory",
+                                "id": "0:3",
+                                "args": null
+                            }}}],
+                            "constraints": []
+                        }}
+                    }},
+                    "items": [],
+                    "is_negative": false,
+                    "is_synthetic": false,
+                    "blanket_impl": null
+                }})),
+                "0:5": item(0, "", json!({"impl": {
+                    "is_unsafe": false,
+                    "generics": {"params": [], "where_predicates": []},
+                    "provided_trait_methods": [],
+                    "trait": {"path": "CartridgeMemory", "id": "0:2", "args": null},
+                    "for": {"resolved_path": {"path": "NromMemory", "id": "0:3", "args": null}},
+                    "items": [],
+                    "is_negative": false,
+                    "is_synthetic": false,
+                    "blanket_impl": null
+                }}))
+            },
+            "paths": {
+                "0:1": {"crate_id": 0, "path": ["test_crate", "Cartridge"], "kind": "struct"},
+                "0:2": {"crate_id": 0, "path": ["test_crate", "CartridgeMemory"], "kind": "trait"},
+                "0:3": {"crate_id": 0, "path": ["test_crate", "NromMemory"], "kind": "struct"}
+            }
+        });
+
+        let graph = TypeGraph::from_rustdoc_json(&json, false).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .contains(&("0:1".to_string(), "0:2".to_string()))
+        );
+        assert!(
+            !graph
+                .edges
+                .contains(&("0:1".to_string(), "0:3".to_string()))
+        );
+        assert!(
+            graph
+                .edges
+                .contains(&("0:3".to_string(), "0:2".to_string()))
         );
     }
 
