@@ -2,7 +2,7 @@
 name = "cargo-typegraph"
 version = "0.1.0"
 edition = "2024"
-description = "Generate Graphviz DOT type dependency graphs from rustdoc JSON."
+description = "Generate Graphviz DOT dependency graphs for Rust types."
 readme = "README.md"
 license = "CC0-1.0"
 keywords = ["cargo", "graphviz", "rustdoc", "types"]

@@ -1,10 +1,9 @@
 # cargo-typegraph
 
-`cargo-typegraph` generates a Graphviz DOT graph of Rust type dependencies from
-rustdoc JSON. It can run as a Cargo subcommand (`cargo typegraph`) or as a
-standalone binary.
+`cargo-typegraph` generates Graphviz DOT dependency graphs for Rust types. It
+can run as a Cargo subcommand (`cargo typegraph`) or as a standalone binary.
 
-The graph includes local structs, enums, traits, type aliases. Edges
+The graph includes local structs, enums, traits, and type aliases. Edges
 point from a type to the types referenced by its definition, fields,
 aliases, generics, bounds, and implementations. Nodes are colored by
 visibility so public, crate-visible, super-visible, restricted, and
@@ -103,6 +102,10 @@ to a file.
 By default, `cargo-typegraph` asks rustdoc to include private items so the graph
 can describe internal type structure. Use `--no-private` when you only want the
 types exposed by normal generated documentation.
+
+Internally, `cargo-typegraph` builds graphs from rustdoc JSON. By default it
+invokes `cargo doc` with the required rustdoc JSON options, but `--json` can
+read an existing rustdoc JSON file directly.
 
 ## License
 
