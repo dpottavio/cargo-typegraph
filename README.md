@@ -1,5 +1,13 @@
 # cargo-typegraph
 
+[![crates-badge][crates-badge]][crates-url]
+[![cc0-badge][cc0-badge]][cc0-url]
+
+[crates-badge]: https://img.shields.io/crates/v/cargo-typegraph
+[crates-url]: https://crates.io/crates/cargo-typegraph
+[cc0-badge]: https://img.shields.io/badge/license-CC0_1.0-blue
+[cc0-url]: https://creativecommons.org/publicdomain/zero/1.0/
+
 `cargo-typegraph` generates Graphviz DOT dependency graphs for Rust types. It
 can run as a Cargo subcommand (`cargo typegraph`) or as a standalone binary.
 
