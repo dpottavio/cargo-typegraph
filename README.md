@@ -63,6 +63,12 @@ Include external referenced types as graph nodes:
 cargo typegraph --include-external -o typegraph.dot
 ```
 
+Detect dependency cycles and fail when any are found:
+
+```sh
+cargo typegraph --detect-cycles -o typegraph.dot
+```
+
 Pass additional arguments through to `cargo doc` after `--`:
 
 ```sh
@@ -75,6 +81,7 @@ cargo typegraph -o typegraph.dot -- --workspace
 --json <PATH>                 Read an existing rustdoc JSON file
 -o, --output <PATH>           Write DOT to a file instead of stdout
 --include-external            Include referenced external types as graph nodes
+--detect-cycles               Print the first dependency cycle to stderr and exit with an error
 --no-private                  Do not pass --document-private-items to cargo doc
 --manifest-path <PATH>        Cargo manifest path for cargo doc
 -p, --package <PACKAGE>       Package to document

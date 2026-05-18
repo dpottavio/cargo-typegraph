@@ -38,13 +38,19 @@ fn run() -> Result<()> {
     let input = fs::read_to_string(&json_path)?;
     let json: Value = serde_json::from_str(&input)?;
     let graph = TypeGraph::from_rustdoc_json(&json, config.include_external)?;
-    let dot = graph.to_dot();
+
+    if config.detect_cycles {
+        if let Some(cycle) = graph.dependency_cycle() {
+            eprintln!("dependency cycle: {}", graph.format_cycle(&cycle));
+            return Err("dependency cycle detected".into());
+        }
+    }
 
     match &config.output {
-        Some(path) => fs::write(path, dot)?,
+        Some(path) => fs::write(path, graph.to_dot())?,
         None => {
             let mut stdout = io::stdout().lock();
-            stdout.write_all(dot.as_bytes())?;
+            stdout.write_all(graph.to_dot().as_bytes())?;
         }
     }
 
@@ -65,6 +71,7 @@ struct Config {
     no_default_features: bool,
     document_private_items: bool,
     include_external: bool,
+    detect_cycles: bool,
     cargo_args: Vec<OsString>,
     help: bool,
     version: bool,
@@ -85,6 +92,7 @@ impl Default for Config {
             no_default_features: false,
             document_private_items: true,
             include_external: false,
+            detect_cycles: false,
             cargo_args: Vec::new(),
             help: false,
             version: false,
@@ -123,6 +131,7 @@ impl Config {
                     config.document_private_items = false
                 }
                 "--include-external" => config.include_external = true,
+                "--detect-cycles" => config.detect_cycles = true,
                 "--all-features" => config.all_features = true,
                 "--no-default-features" => config.no_default_features = true,
                 "-o" | "--output" | "--json" | "--manifest-path" | "-p" | "--package"
@@ -190,6 +199,7 @@ OPTIONS:
         --json <PATH>                 Read an existing rustdoc JSON file
     -o, --output <PATH>               Write DOT to a file instead of stdout
         --include-external            Include referenced external types as graph nodes
+        --detect-cycles               Print the first dependency cycle to stderr and exit with an error
         --no-private                  Do not pass --document-private-items to cargo doc
         --manifest-path <PATH>        Cargo manifest path for cargo doc
     -p, --package <PACKAGE>           Package to document
@@ -526,6 +536,90 @@ impl TypeGraph {
 
         dot.push_str("}\n");
         dot
+    }
+
+    fn dependency_cycle(&self) -> Option<Vec<String>> {
+        let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (source, target) in &self.edges {
+            adjacency
+                .entry(source.as_str())
+                .or_default()
+                .push(target.as_str());
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut path = Vec::new();
+        let mut path_positions = BTreeMap::new();
+
+        for start in self.nodes.keys() {
+            let start = start.as_str();
+            if visited.contains(start) {
+                continue;
+            }
+
+            if let Some(cycle) = Self::find_cycle_from(
+                start,
+                &adjacency,
+                &mut visited,
+                &mut path,
+                &mut path_positions,
+            )
+            {
+                return Some(cycle);
+            }
+        }
+
+        None
+    }
+
+    fn find_cycle_from<'a>(
+        current: &'a str,
+        adjacency: &BTreeMap<&'a str, Vec<&'a str>>,
+        visited: &mut BTreeSet<&'a str>,
+        path: &mut Vec<&'a str>,
+        path_positions: &mut BTreeMap<&'a str, usize>,
+    ) -> Option<Vec<String>> {
+        visited.insert(current);
+        path_positions.insert(current, path.len());
+        path.push(current);
+
+        for &target in adjacency.get(current).map(Vec::as_slice).unwrap_or(&[]) {
+            if let Some(&cycle_start) = path_positions.get(target) {
+                let mut cycle = path[cycle_start..]
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect::<Vec<_>>();
+                cycle.push(target.to_string());
+                return Some(cycle);
+            }
+
+            if visited.contains(target) {
+                continue;
+            }
+
+            if let Some(cycle) =
+                Self::find_cycle_from(target, adjacency, visited, path, path_positions)
+            {
+                return Some(cycle);
+            }
+        }
+
+        path_positions.remove(current);
+        path.pop();
+        None
+    }
+
+    fn format_cycle(&self, cycle: &[String]) -> String {
+        cycle
+            .iter()
+            .map(|id| {
+                self.nodes
+                    .get(id)
+                    .map(|node| node.label.as_str())
+                    .unwrap_or(id)
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ")
     }
 }
 
@@ -864,6 +958,7 @@ mod tests {
 
         assert!(config.output.is_none());
         assert!(config.document_private_items);
+        assert!(!config.detect_cycles);
         assert_eq!(config.toolchain.as_deref(), Some("nightly"));
     }
 
@@ -890,6 +985,13 @@ mod tests {
                 .unwrap();
 
         assert_eq!(config.output, Some(PathBuf::from("graph.dot")));
+    }
+
+    #[test]
+    fn can_enable_dependency_cycle_detection() {
+        let config = Config::parse([OsString::from("--detect-cycles")].into_iter()).unwrap();
+
+        assert!(config.detect_cycles);
     }
 
     #[test]
@@ -996,6 +1098,52 @@ mod tests {
             graph
                 .edges
                 .contains(&("0:1".to_string(), "1:0".to_string()))
+        );
+    }
+
+    #[test]
+    fn detects_first_dependency_cycle_by_smallest_node_id() {
+        let json = json!({
+            "root": "0:0",
+            "index": {
+                "0:0": item(0, "test_crate", json!({"module": {"items": ["0:1", "0:3", "0:5", "0:7"]}})),
+                "0:1": item(0, "A", json!({"struct": {"fields": ["0:2"]}})),
+                "0:2": item(0, "field", json!({"struct_field": {
+                    "resolved_path": {"name": "B", "id": "0:3"}
+                }})),
+                "0:3": item(0, "B", json!({"struct": {"fields": ["0:4"]}})),
+                "0:4": item(0, "field", json!({"struct_field": {
+                    "resolved_path": {"name": "C", "id": "0:5"}
+                }})),
+                "0:5": item(0, "C", json!({"struct": {"fields": ["0:6"]}})),
+                "0:6": item(0, "field", json!({"struct_field": {
+                    "resolved_path": {"name": "A", "id": "0:1"}
+                }})),
+                "0:7": item(0, "D", json!({"struct": {"fields": []}}))
+            },
+            "paths": {
+                "0:1": {"crate_id": 0, "path": ["test_crate", "A"], "kind": "struct"},
+                "0:3": {"crate_id": 0, "path": ["test_crate", "B"], "kind": "struct"},
+                "0:5": {"crate_id": 0, "path": ["test_crate", "C"], "kind": "struct"},
+                "0:7": {"crate_id": 0, "path": ["test_crate", "D"], "kind": "struct"}
+            }
+        });
+
+        let graph = TypeGraph::from_rustdoc_json(&json, false).unwrap();
+        let cycle = graph.dependency_cycle().unwrap();
+
+        assert_eq!(
+            cycle,
+            vec![
+                "0:1".to_string(),
+                "0:3".to_string(),
+                "0:5".to_string(),
+                "0:1".to_string()
+            ]
+        );
+        assert_eq!(
+            graph.format_cycle(&cycle),
+            "test_crate::A -> test_crate::B -> test_crate::C -> test_crate::A"
         );
     }
 
