@@ -742,6 +742,28 @@ fn collect_type_refs(
                     continue;
                 }
 
+                // Only these lists contain bare item IDs. Other scalar values
+                // (array lengths, discriminants, names, etc.) are not references,
+                // even when their text happens to match an ID in the index.
+                if matches!(
+                    key.as_str(),
+                    "fields" | "variants" | "impls" | "items" | "tuple"
+                ) {
+                    if let Some(items) = nested.as_array() {
+                        for id in items.iter().filter_map(id_value_to_string) {
+                            consider_reference(
+                                &id,
+                                source_id,
+                                document,
+                                local_type_ids,
+                                include_external,
+                                deps,
+                                seen_items,
+                            );
+                        }
+                    }
+                }
+
                 collect_type_refs(
                     nested,
                     source_id,
@@ -766,24 +788,6 @@ fn collect_type_refs(
                 );
             }
         }
-        Value::String(id) => consider_reference(
-            id,
-            source_id,
-            document,
-            local_type_ids,
-            include_external,
-            deps,
-            seen_items,
-        ),
-        Value::Number(number) => consider_reference(
-            &number.to_string(),
-            source_id,
-            document,
-            local_type_ids,
-            include_external,
-            deps,
-            seen_items,
-        ),
         _ => {}
     }
 }
@@ -1208,6 +1212,78 @@ mod tests {
 
         assert!(graph.edges.contains(&("20".to_string(), "30".to_string())));
         assert!(graph.edges.contains(&("20".to_string(), "40".to_string())));
+    }
+
+    #[test]
+    fn ignores_scalar_values_that_collide_with_item_ids() {
+        let json = json!({
+            "root": 0,
+            "index": {
+                "0": item(0, "test_crate", json!({"module": {"items": [1, 32, 40, 50, 60, 256]}})),
+                "1": item(0, "Ppu", json!({"struct": {
+                    "kind": {"plain": {"fields": [2, 3, 4]}},
+                    "impls": [5]
+                }})),
+                "2": item(0, "oam", json!({"struct_field": {
+                    "array": {"type": {"primitive": "u8"}, "len": "256"}
+                }})),
+                "3": item(0, "palette", json!({"struct_field": {
+                    "array": {"type": {"primitive": "u8"}, "len": "32"}
+                }})),
+                "4": item(0, "sprites", json!({"struct_field": {
+                    "array": {
+                        "type": {"resolved_path": {"path": "SpriteState", "id": 40}},
+                        "len": "8"
+                    }
+                }})),
+                "5": item(0, "", json!({"impl": {
+                    "for": {"resolved_path": {"path": "Ppu", "id": 1}},
+                    "is_synthetic": false,
+                    "items": [6]
+                }})),
+                "6": item(0, "read", json!({"function": {
+                    "sig": {"inputs": [], "output": {
+                        "resolved_path": {"path": "Bus", "id": 50}
+                    }}
+                }})),
+                "8": item(0, "Noise", json!({"struct": {"fields": []}})),
+                "32": item(0, "Apu", json!({"struct": {"fields": []}})),
+                "40": item(0, "SpriteState", json!({"struct": {"fields": []}})),
+                "50": item(0, "Bus", json!({"struct": {"fields": []}})),
+                "60": item(0, "Status", json!({"enum": {"variants": [61, 62]}})),
+                "61": item(0, "Ready", json!({"variant": {
+                    "kind": "plain",
+                    "discriminant": {"expr": "32", "value": "32"}
+                }})),
+                "62": item(0, "Sprite", json!({"variant": {"kind": {"tuple": [63, null]}}})),
+                "63": item(0, "0", json!({"struct_field": {
+                    "resolved_path": {"path": "SpriteState", "id": 40}
+                }})),
+                "70": item(0, "Wrapper", json!({"struct": {"kind": {"tuple": ["71"]}}})),
+                "71": item(0, "0", json!({"struct_field": {
+                    "tuple": [{"resolved_path": {"path": "Bus", "id": "50"}}]
+                }})),
+                "256": item(0, "noise", json!({"module": {"items": [8]}}))
+            }
+        });
+
+        // Constants may be strings or numbers; neither representation is an ID.
+        for numeric_len in [false, true] {
+            let mut json = json.clone();
+            if numeric_len {
+                json["index"]["2"]["inner"]["struct_field"]["array"]["len"] = json!(256);
+            }
+            let graph = TypeGraph::from_rustdoc_json(&json, false).unwrap();
+            assert_eq!(
+                graph.edges,
+                BTreeSet::from([
+                    ("1".to_string(), "40".to_string()),
+                    ("1".to_string(), "50".to_string()),
+                    ("60".to_string(), "40".to_string()),
+                    ("70".to_string(), "50".to_string()),
+                ])
+            );
+        }
     }
 
     #[test]
