@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -265,21 +265,33 @@ fn build_rustdoc_json(config: &Config) -> Result<PathBuf> {
     }
     command.args(&config.cargo_args);
 
-    let status = command.status()?;
-    if !status.success() {
+    command.arg("--message-format=json");
+    let output = command.stderr(Stdio::inherit()).output()?;
+    let messages = String::from_utf8(output.stdout)?;
+    for line in messages.lines() {
+        if let Ok(message) = serde_json::from_str::<Value>(line) {
+            if message.get("reason").and_then(Value::as_str) == Some("compiler-message") {
+                if let Some(rendered) = message["message"]["rendered"].as_str() {
+                    eprint!("{rendered}");
+                }
+            }
+        }
+    }
+    if !output.status.success() {
         return Err(format!(
-            "cargo doc failed with status {status}; rustdoc JSON requires a nightly toolchain, so try --toolchain nightly"
+            "cargo doc failed with status {}; rustdoc JSON requires a nightly toolchain, so try --toolchain nightly",
+            output.status
         )
         .into());
     }
 
-    best_rustdoc_json_file(&target_dir)?.ok_or_else(|| {
-        format!(
-            "cargo doc succeeded but no rustdoc JSON file was found under {}",
-            target_dir.display()
-        )
-        .into()
-    })
+    let search_dir = match &config.target {
+        Some(target) => {
+            target_dir.join(Path::new(target).file_stem().ok_or("invalid target name")?)
+        }
+        None => target_dir,
+    };
+    rustdoc_json_from_artifacts(&search_dir, &messages)
 }
 
 fn rustdoc_json_flags() -> OsString {
@@ -291,68 +303,87 @@ fn rustdoc_json_flags() -> OsString {
     flags
 }
 
-fn best_rustdoc_json_file(root: &Path) -> Result<Option<PathBuf>> {
-    let mut best: Option<(usize, std::time::SystemTime, PathBuf)> = None;
-    let mut stack = vec![root.to_path_buf()];
+fn rustdoc_json_from_artifacts(root: &Path, messages: &str) -> Result<PathBuf> {
+    let mut filenames = BTreeSet::new();
+    for line in messages.lines() {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        // Cargo's documentation artifacts have no compiler output filenames.
+        // Dependency compilation artifacts have filenames and must be ignored.
+        if message.get("reason").and_then(Value::as_str) != Some("compiler-artifact")
+            || !message
+                .get("filenames")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            || message["target"]["doc"].as_bool() != Some(true)
+        {
+            continue;
+        }
+        if let Some(name) = message["target"]["name"].as_str() {
+            filenames.insert(format!("{}.json", name.replace('-', "_")));
+        }
+    }
 
+    let mut candidates = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
+            if entry.file_type()?.is_dir() {
                 stack.push(path);
-                continue;
-            }
-
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-
-            let Some(score) = rustdoc_json_score(&path)? else {
-                continue;
-            };
-            let modified = entry.metadata()?.modified()?;
-            match &best {
-                Some((current_score, current_modified, _))
-                    if (*current_score, *current_modified) >= (score, modified) => {}
-                _ => best = Some((score, modified, path)),
+            } else if dir.file_name().is_some_and(|name| name == "doc")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| filenames.contains(name))
+            {
+                candidates.insert(path);
             }
         }
     }
 
-    Ok(best.map(|(_, _, path)| path))
-}
+    let mut matched_names = BTreeSet::new();
+    for path in &candidates {
+        if !matched_names.insert(path.file_name()) {
+            return Err(format!(
+                "multiple rustdoc JSON outputs match the same documented target; select one with --json: {}",
+                candidates.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+            ).into());
+        }
+    }
 
-fn rustdoc_json_score(path: &Path) -> Result<Option<usize>> {
-    let input = fs::read_to_string(path)?;
-    let Ok(json) = serde_json::from_str::<Value>(&input) else {
-        return Ok(None);
-    };
+    // Workspace runs may document both a library and helper crates such as xtask.
+    // Rank only the current invocation's targets, never unrelated cached crates.
+    let mut best: Option<(usize, PathBuf)> = None;
+    for path in candidates {
+        let json: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        let document = RustdocDocument::new(&json)?;
+        let local_crate_id = document
+            .local_crate_id()
+            .ok_or("rustdoc JSON is missing its root crate")?;
+        let score = document
+            .index
+            .values()
+            .filter(|item| {
+                item_crate_id(item).as_deref() == Some(local_crate_id.as_str())
+                    && item.get("name").and_then(Value::as_str).is_some()
+                    && item_kind(item).is_some_and(is_type_definition_kind)
+            })
+            .count();
+        // Candidates are sorted by path, making equal-score selection deterministic.
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, path));
+        }
+    }
 
-    let Some(index) = json.get("index").and_then(Value::as_object) else {
-        return Ok(None);
-    };
-
-    let local_crate_id = json
-        .get("root")
-        .and_then(id_value_to_string)
-        .and_then(|root| index.get(&root))
-        .and_then(item_crate_id);
-
-    let score = index
-        .values()
-        .filter(|item| {
-            local_crate_id
-                .as_deref()
-                .is_none_or(|crate_id| item_crate_id(item).as_deref() == Some(crate_id))
-        })
-        .filter(|item| item.get("name").and_then(Value::as_str).is_some())
-        .filter_map(item_kind)
-        .filter(|kind| is_type_definition_kind(kind))
-        .count();
-
-    Ok(Some(score))
+    best.map(|(_, path)| path).ok_or_else(|| {
+        "cargo doc succeeded but no rustdoc JSON was found for its documented targets".into()
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +765,14 @@ fn collect_type_refs(
                 && object.contains_key("is_synthetic")
                 && object.contains_key("items");
 
+            // An impl can also be listed under types used as trait arguments.
+            // Only attribute it to the type it actually implements the trait for.
+            if is_impl_object
+                && object.get("for").and_then(impl_self_type_id).as_deref() != Some(source_id)
+            {
+                return;
+            }
+
             for (key, nested) in object {
                 if is_rustdoc_backreference_key(key) {
                     continue;
@@ -790,6 +829,17 @@ fn collect_type_refs(
         }
         _ => {}
     }
+}
+
+fn impl_self_type_id(ty: &Value) -> Option<String> {
+    if let Some(path) = ty.get("resolved_path") {
+        return path.get("id").and_then(id_value_to_string);
+    }
+    // Implementations for references and pointers still belong to the pointee.
+    ty.get("borrowed_ref")
+        .or_else(|| ty.get("raw_pointer"))
+        .and_then(|reference| reference.get("type"))
+        .and_then(impl_self_type_id)
 }
 
 fn is_rustdoc_backreference_key(key: &str) -> bool {
@@ -1005,13 +1055,13 @@ mod tests {
     }
 
     #[test]
-    fn finds_best_rustdoc_json_and_ignores_other_json_files() {
+    fn selects_documented_target_instead_of_larger_cached_crate() {
         let root = temp_test_dir("rustdoc-json-selection");
         fs::create_dir_all(root.join("doc")).unwrap();
         fs::create_dir_all(root.join(".fingerprint")).unwrap();
 
         let rustdoc_json = root.join("doc").join("crate.json");
-        let tiny_rustdoc_json = root.join("doc").join("tiny.json");
+        let tiny_rustdoc_json = root.join("doc").join("tiny_crate.json");
         let sidecar_json = root.join(".fingerprint").join("newer.json");
         fs::write(
             &rustdoc_json,
@@ -1042,10 +1092,83 @@ mod tests {
         .unwrap();
         fs::write(&sidecar_json, r#"{"package":"not rustdoc"}"#).unwrap();
 
-        let found = best_rustdoc_json_file(&root).unwrap();
+        for fresh in [false, true] {
+            let messages = format!(
+                "{}\n{}\n{}\n",
+                json!({"reason": "compiler-artifact", "target": {"name": "crate", "doc": true},
+                    "filenames": ["libcrate.rmeta"], "fresh": fresh}),
+                json!({"reason": "compiler-artifact", "target": {"name": "tiny-crate", "doc": true},
+                    "filenames": [], "fresh": fresh}),
+                json!({"reason": "build-finished", "success": true}),
+            );
+            assert_eq!(
+                rustdoc_json_from_artifacts(&root, &messages).unwrap(),
+                tiny_rustdoc_json
+            );
+        }
+
+        let large_artifact = json!({"reason": "compiler-artifact",
+            "target": {"name": "crate", "doc": true}, "filenames": []});
+        let tiny_artifact = json!({"reason": "compiler-artifact",
+            "target": {"name": "tiny-crate", "doc": true}, "filenames": []});
+        assert_eq!(
+            rustdoc_json_from_artifacts(&root, &format!("{large_artifact}\n{tiny_artifact}"))
+                .unwrap(),
+            rustdoc_json
+        );
+
+        // Never fall back to the unrelated cached crate if the selected output is absent.
+        fs::remove_file(&tiny_rustdoc_json).unwrap();
+        assert!(rustdoc_json_from_artifacts(&root, &tiny_artifact.to_string()).is_err());
+        assert!(rustdoc_json_from_artifacts(&root, "").is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn selects_largest_current_workspace_crate_without_using_stale_output() {
+        let root = temp_test_dir("workspace-json-selection");
+        fs::create_dir_all(root.join("doc")).unwrap();
+
+        for (name, local_types, external_types, functions) in [
+            ("takora_core", 2, 0, 0),
+            ("xtask", 0, 5, 5),
+            ("stale_crate", 10, 0, 0),
+        ] {
+            let mut index = Map::new();
+            index.insert("0".into(), item(0, name, json!({"module": {"items": []}})));
+            for id in 1..=local_types + external_types + functions {
+                let (crate_id, inner) = if id <= local_types {
+                    (0, json!({"struct": {"fields": []}}))
+                } else if id <= local_types + external_types {
+                    (1, json!({"struct": {"fields": []}}))
+                } else {
+                    (0, json!({"function": {}}))
+                };
+                index.insert(id.to_string(), item(crate_id, "Item", inner));
+            }
+            fs::write(
+                root.join("doc").join(format!("{name}.json")),
+                json!({"root": 0, "index": index}).to_string(),
+            )
+            .unwrap();
+        }
+
+        let core_artifact = json!({"reason": "compiler-artifact",
+            "target": {"name": "takora_core", "doc": true}, "filenames": []});
+        let xtask_artifact = json!({"reason": "compiler-artifact",
+            "target": {"name": "xtask", "doc": true}, "filenames": []});
+        assert_eq!(
+            rustdoc_json_from_artifacts(&root, &format!("{core_artifact}\n{xtask_artifact}"))
+                .unwrap(),
+            root.join("doc/takora_core.json")
+        );
+        // An explicitly selected helper crate must still win over the larger core crate.
+        assert_eq!(
+            rustdoc_json_from_artifacts(&root, &xtask_artifact.to_string()).unwrap(),
+            root.join("doc/xtask.json")
+        );
 
         fs::remove_dir_all(&root).unwrap();
-        assert_eq!(found, Some(rustdoc_json));
     }
 
     #[test]
@@ -1335,6 +1458,53 @@ mod tests {
                 .edges
                 .contains(&("0:2".to_string(), "0:1".to_string()))
         );
+    }
+
+    #[test]
+    fn ignores_impls_listed_under_trait_arguments() {
+        let json = json!({
+            "root": 0,
+            "index": {
+                "0": item(0, "test_crate", json!({"module": {"items": [1, 2, 3, 7]}})),
+                "1": item(0, "Source", json!({"struct": {"fields": [], "impls": [4]}})),
+                "2": item(0, "Argument", json!({"struct": {"fields": [], "impls": [4]}})),
+                "3": item(0, "Convert", json!({"trait": {"items": [], "implementations": [4]}})),
+                "4": item(0, "", json!({"impl": {
+                    "for": {"resolved_path": {"path": "Source", "id": 1}},
+                    "trait": {"path": "Convert", "id": 3, "args": {"angle_bracketed": {
+                        "args": [{"type": {"resolved_path": {"path": "Argument", "id": 2}}}],
+                        "constraints": []
+                    }}},
+                    "is_synthetic": false,
+                    "items": [5],
+                    "blanket_impl": null
+                }})),
+                "5": item(0, "make", json!({"function": {"sig": {
+                    "inputs": [["output", {"resolved_path": {"path": "Output", "id": 7}}]],
+                    "output": {"resolved_path": {"path": "Source", "id": 1}}
+                }}})),
+                "7": item(0, "Output", json!({"struct": {"fields": [], "impls": []}}))
+            }
+        });
+
+        // Preserve implementations on the source type and on references to it.
+        for self_type in [
+            json!({"resolved_path": {"path": "Source", "id": 1}}),
+            json!({"borrowed_ref": {"type": {"resolved_path": {"path": "Source", "id": 1}}}}),
+        ] {
+            let mut json = json.clone();
+            json["index"]["4"]["inner"]["impl"]["for"] = self_type;
+            let graph = TypeGraph::from_rustdoc_json(&json, false).unwrap();
+            assert_eq!(
+                graph.edges,
+                BTreeSet::from([
+                    ("1".to_string(), "2".to_string()),
+                    ("1".to_string(), "3".to_string()),
+                    ("1".to_string(), "7".to_string()),
+                ])
+            );
+            assert!(graph.dependency_cycle().is_none());
+        }
     }
 
     #[test]

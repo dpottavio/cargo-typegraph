@@ -82,6 +82,12 @@ Pass additional arguments through to `cargo doc` after `--`:
 cargo typegraph -o typegraph.dot -- --workspace
 ```
 
+The tool selects JSON for the targets reported by the current Cargo invocation,
+ignoring cached documentation for other crates. When a workspace run documents
+multiple targets, it selects the one with the most local type definitions
+(breaking ties by JSON path). Use `-p`, `--bin`, or `-- --lib` to narrow which
+targets Cargo documents, or `--json` to select an existing output directly.
+
 ## Options
 
 ```text
