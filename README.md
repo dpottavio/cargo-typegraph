@@ -17,6 +17,10 @@ aliases, generics, bounds, and implementations. Nodes are colored by
 visibility so public, crate-visible, super-visible, restricted, and
 private types are easy to distinguish.
 
+Use `--color-edges` to color edges by source and help trace crossing lines.
+Edge colors cycle through a palette and do not indicate visibility or
+dependency kind.
+
 ## Requirements
 
 - A nightly Rust toolchain when generating rustdoc JSON directly, because
@@ -76,6 +80,12 @@ Detect dependency cycles and fail when any are found:
 cargo typegraph --detect-cycles -o typegraph.dot
 ```
 
+Color dependency edges by source type (edges use the default color otherwise):
+
+```sh
+cargo typegraph --color-edges -o typegraph.dot
+```
+
 Pass additional arguments through to `cargo doc` after `--`:
 
 ```sh
@@ -94,6 +104,7 @@ targets Cargo documents, or `--json` to select an existing output directly.
 --json <PATH>                 Read an existing rustdoc JSON file
 -o, --output <PATH>           Write DOT to a file instead of stdout
 --include-external            Include referenced external types as graph nodes
+--color-edges                 Color dependency edges by source type
 --detect-cycles               Print the first dependency cycle to stderr and exit with an error
 --no-private                  Do not pass --document-private-items to cargo doc
 --manifest-path <PATH>        Cargo manifest path for cargo doc

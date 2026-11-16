@@ -47,10 +47,10 @@ fn run() -> Result<()> {
     }
 
     match &config.output {
-        Some(path) => fs::write(path, graph.to_dot())?,
+        Some(path) => fs::write(path, graph.to_dot(config.color_edges))?,
         None => {
             let mut stdout = io::stdout().lock();
-            stdout.write_all(graph.to_dot().as_bytes())?;
+            stdout.write_all(graph.to_dot(config.color_edges).as_bytes())?;
         }
     }
 
@@ -71,6 +71,7 @@ struct Config {
     no_default_features: bool,
     document_private_items: bool,
     include_external: bool,
+    color_edges: bool,
     detect_cycles: bool,
     cargo_args: Vec<OsString>,
     help: bool,
@@ -92,6 +93,7 @@ impl Default for Config {
             no_default_features: false,
             document_private_items: true,
             include_external: false,
+            color_edges: false,
             detect_cycles: false,
             cargo_args: Vec::new(),
             help: false,
@@ -131,6 +133,7 @@ impl Config {
                     config.document_private_items = false
                 }
                 "--include-external" => config.include_external = true,
+                "--color-edges" => config.color_edges = true,
                 "--detect-cycles" => config.detect_cycles = true,
                 "--all-features" => config.all_features = true,
                 "--no-default-features" => config.no_default_features = true,
@@ -199,6 +202,7 @@ OPTIONS:
         --json <PATH>                 Read an existing rustdoc JSON file
     -o, --output <PATH>               Write DOT to a file instead of stdout
         --include-external            Include referenced external types as graph nodes
+        --color-edges                 Color dependency edges by source type
         --detect-cycles               Print the first dependency cycle to stderr and exit with an error
         --no-private                  Do not pass --document-private-items to cargo doc
         --manifest-path <PATH>        Cargo manifest path for cargo doc
@@ -520,7 +524,7 @@ impl TypeGraph {
         Ok(graph)
     }
 
-    fn to_dot(&self) -> String {
+    fn to_dot(&self, color_edges: bool) -> String {
         let mut dot = String::from("digraph typegraph {\n");
         dot.push_str("  rankdir=LR;\n");
         dot.push_str("  graph [fontname=\"monospace\"];\n");
@@ -557,11 +561,33 @@ impl TypeGraph {
             dot.push('\n');
         }
 
+        // Distinguish crossing edges from different sources in dense graphs.
+        // These colors identify sources, independently of node visibility colors.
+        let edge_colors = [
+            "#0072b2", "#d55e00", "#009e73", "#cc79a7", "#8c564b", "#6f63b6",
+        ];
+        let sources: BTreeSet<_> = self
+            .edges
+            .iter()
+            .filter(|_| color_edges)
+            .map(|(source, _)| source)
+            .collect();
+        let source_colors: BTreeMap<_, _> = sources
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| (source, edge_colors[index % edge_colors.len()]))
+            .collect();
+
         for (source, target) in &self.edges {
+            let color = source_colors
+                .get(source)
+                .map(|color| format!(" [color=\"{color}\"]"))
+                .unwrap_or_default();
             dot.push_str(&format!(
-                "  \"{}\" -> \"{}\";\n",
+                "  \"{}\" -> \"{}\"{};\n",
                 escape_dot(source),
-                escape_dot(target)
+                escape_dot(target),
+                color
             ));
         }
 
@@ -1019,6 +1045,7 @@ mod tests {
         assert!(config.output.is_none());
         assert!(config.document_private_items);
         assert!(!config.detect_cycles);
+        assert!(!config.color_edges);
         assert_eq!(config.toolchain.as_deref(), Some("nightly"));
     }
 
@@ -1052,6 +1079,38 @@ mod tests {
         let config = Config::parse([OsString::from("--detect-cycles")].into_iter()).unwrap();
 
         assert!(config.detect_cycles);
+    }
+
+    #[test]
+    fn colors_edges_only_when_requested() {
+        let graph = TypeGraph {
+            edges: BTreeSet::from([
+                ("1".to_string(), "2".to_string()),
+                ("1".to_string(), "3".to_string()),
+                ("2".to_string(), "3".to_string()),
+            ]),
+            ..TypeGraph::default()
+        };
+
+        for args in [vec![], vec![OsString::from("--color-edges")]] {
+            let config = Config::parse(args.into_iter()).unwrap();
+            let dot = graph.to_dot(config.color_edges);
+            let edges: Vec<_> = dot.lines().filter(|line| line.contains(" -> ")).collect();
+            assert_eq!(edges.len(), 3);
+            assert!(edges[0].starts_with("  \"1\" -> \"2\""));
+            assert!(edges[1].starts_with("  \"1\" -> \"3\""));
+            assert!(edges[2].starts_with("  \"2\" -> \"3\""));
+            if config.color_edges {
+                let colors: Vec<_> = edges
+                    .iter()
+                    .map(|edge| edge.split("color=\"").nth(1).unwrap())
+                    .collect();
+                assert_eq!(colors[0], colors[1]);
+                assert_ne!(colors[0], colors[2]);
+            } else {
+                assert!(edges.iter().all(|edge| !edge.contains("color=")));
+            }
+        }
     }
 
     #[test]
@@ -1631,7 +1690,9 @@ mod tests {
             }
         });
 
-        let dot = TypeGraph::from_rustdoc_json(&json, false).unwrap().to_dot();
+        let dot = TypeGraph::from_rustdoc_json(&json, false)
+            .unwrap()
+            .to_dot(false);
 
         assert!(dot.contains("node [shape=plain, fontname=\"monospace\"]"));
         assert!(dot.contains(
